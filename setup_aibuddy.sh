@@ -1,0 +1,1371 @@
+#!/bin/bash
+# setup_aibuddy.sh - Installation script for AIBuddy CLI Assistant
+# Uses local GGUF model file with CMake-based llama.cpp build
+# Updated for latest llama.cpp version with proper CUDA flags
+
+set -e # Exit on any error
+
+# Constants
+LOG_FILE="$HOME/aibuddy_setup.log"
+INSTALL_DIR="$HOME/aibuddy"
+CONFIG_DIR="$HOME/.config/aibuddy"
+LLAMA_CPP_DIR="$HOME/llama.cpp"
+MODEL_PATH="/home/katana/projects/linux/aibuddy/agentica-org_DeepScaleR-1.5B-Preview-Q8_0.gguf"
+
+# Clear log file
+echo "=== AIBuddy Setup $(date) ===" > "$LOG_FILE"
+
+# Function to print colored status messages
+print_status() {
+    local color=$1
+    local message=$2
+    case $color in
+        "green")  echo -e "\e[32m$message\e[0m" | tee -a "$LOG_FILE" ;;
+        "yellow") echo -e "\e[33m$message\e[0m" | tee -a "$LOG_FILE" ;;
+        "red")    echo -e "\e[31m$message\e[0m" | tee -a "$LOG_FILE" ;;
+        *)        echo "$message" | tee -a "$LOG_FILE" ;;
+    esac
+}
+
+# Check system requirements
+check_system() {
+    print_status "green" "Checking system requirements..."
+    
+    # Check for Python
+    if ! command -v python3 &> /dev/null; then
+        print_status "red" "Python 3 not found. Please install Python 3.8 or newer."
+        exit 1
+    fi
+    
+    # Check Python version
+    PY_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+    print_status "green" "Found Python $PY_VER"
+    
+    # Check for pip
+    if ! command -v pip3 &> /dev/null; then
+        print_status "yellow" "pip3 not found. Attempting to install..."
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y python3-pip
+        elif command -v pacman &> /dev/null; then
+            sudo pacman -S python-pip
+        elif command -v dnf &> /dev/null; then
+            sudo dnf install -y python3-pip
+        else
+            print_status "red" "Could not install pip. Please install it manually."
+            exit 1
+        fi
+    fi
+    
+    # Check for CMake (required for llama.cpp)
+    if ! command -v cmake &> /dev/null; then
+        print_status "yellow" "CMake not found. Installing..."
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y cmake
+        elif command -v pacman &> /dev/null; then
+            sudo pacman -S cmake
+        elif command -v dnf &> /dev/null; then
+            sudo dnf install -y cmake
+        else
+            print_status "red" "Could not install CMake. Please install it manually."
+            exit 1
+        fi
+    fi
+    
+    # Check if model exists
+    if [ ! -f "$MODEL_PATH" ]; then
+        print_status "red" "Model not found at $MODEL_PATH."
+        read -p "Enter the full path to your GGUF model file: " custom_model_path
+        if [ -f "$custom_model_path" ]; then
+            MODEL_PATH="$custom_model_path"
+            print_status "green" "Using model at $MODEL_PATH"
+        else
+            print_status "red" "Model file not found. Exiting."
+            exit 1
+        fi
+    else
+        print_status "green" "Found model at $MODEL_PATH"
+    fi
+    
+    # Check for build essentials
+    if ! command -v g++ &> /dev/null; then
+        print_status "yellow" "Build tools not found. Installing..."
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y build-essential
+        elif command -v pacman &> /dev/null; then
+            sudo pacman -S base-devel
+        elif command -v dnf &> /dev/null; then
+            sudo dnf install -y make gcc-c++
+        else
+            print_status "red" "Could not install build tools. Please install it manually."
+            exit 1
+        fi
+    fi
+    
+    # Check for git
+    if ! command -v git &> /dev/null; then
+        print_status "yellow" "Git not found. Installing..."
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y git
+        elif command -v pacman &> /dev/null; then
+            sudo pacman -S git
+        elif command -v dnf &> /dev/null; then
+            sudo dnf install -y git
+        else
+            print_status "red" "Could not install git. Please install it manually."
+            exit 1
+        fi
+    fi
+    
+    # Check ports
+    if command -v lsof &> /dev/null; then
+        if lsof -i:8080 &>/dev/null; then
+            print_status "yellow" "Port 8080 is already in use. We'll use a different port."
+            DEFAULT_PORT=8081
+        else
+            DEFAULT_PORT=8080
+        fi
+    else
+        DEFAULT_PORT=8080
+    fi
+}
+
+# Create virtual environment
+setup_venv() {
+    print_status "green" "Setting up virtual environment..."
+    
+    # Create the installation directory if it doesn't exist
+    mkdir -p "$INSTALL_DIR"
+    
+    # Check if venv module is available
+    if ! python3 -c "import venv" &> /dev/null; then
+        print_status "yellow" "Python venv module not found. Installing..."
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y python3-venv
+        elif command -v pacman &> /dev/null; then
+            sudo pacman -S python-virtualenv
+        elif command -v dnf &> /dev/null; then
+            sudo dnf install -y python3-virtualenv
+        else
+            print_status "red" "Could not install venv. Please install it manually."
+            exit 1
+        fi
+    fi
+    
+    # Create virtual environment
+    if [ ! -d "$INSTALL_DIR/venv" ]; then
+        print_status "green" "Creating virtual environment"
+        python3 -m venv "$INSTALL_DIR/venv"
+    fi
+    
+    # Activate virtual environment
+    source "$INSTALL_DIR/venv/bin/activate"
+    
+    # Upgrade pip
+    python -m pip install --upgrade pip setuptools wheel
+}
+
+# Install dependencies
+install_dependencies() {
+    print_status "green" "Installing Python dependencies..."
+    
+    # Make sure we're in the virtual environment
+    source "$INSTALL_DIR/venv/bin/activate"
+    
+    # Install dependencies (updated list with latest versions)
+    pip install --upgrade click requests colorama tqdm psutil
+}
+
+# Build llama.cpp with CMake
+build_llama_cpp() {
+# Completely remove any existing build to avoid cached configuration
+if [ -d "$LLAMA_CPP_DIR/build" ]; then
+    print_status "yellow" "Removing existing build directory to avoid cached configurations"
+    rm -rf "$LLAMA_CPP_DIR/build"
+fi
+    print_status "green" "Building llama.cpp with CMake..."
+    
+    # Clone llama.cpp if it doesn't exist
+    if [ ! -d "$LLAMA_CPP_DIR" ]; then
+        print_status "green" "Cloning llama.cpp repository..."
+        git clone https://github.com/ggerganov/llama.cpp.git "$LLAMA_CPP_DIR"
+    else
+        print_status "green" "Updating llama.cpp repository..."
+        (cd "$LLAMA_CPP_DIR" && git pull)
+    fi
+    
+    # Create build directory
+    mkdir -p "$LLAMA_CPP_DIR/build"
+    cd "$LLAMA_CPP_DIR/build"
+    
+# Check for CUDA with correct, updated flags
+if command -v nvcc &> /dev/null; then
+    print_status "green" "CUDA found, building with CUDA support."
+    CMAKE_ARGS="-DGGML_CUDA=ON -DBUILD_SERVER=ON -DCMAKE_BUILD_TYPE=Release"
+else
+    print_status "yellow" "CUDA not found, building CPU-only version."
+    CMAKE_ARGS="-DBUILD_SERVER=ON -DCMAKE_BUILD_TYPE=Release"
+fi
+    
+    # Configure and build with updated flags
+    print_status "green" "Configuring llama.cpp build..."
+print_status "green" "Running: cmake .. $CMAKE_ARGS"
+cmake .. $CMAKE_ARGS    
+    print_status "green" "Building llama.cpp..."
+    cmake --build . --config Release -j$(nproc)
+    
+    # Check if build succeeded
+    if [ ! -f "$LLAMA_CPP_DIR/build/bin/server" ] && [ ! -f "$LLAMA_CPP_DIR/build/server" ]; then
+        print_status "yellow" "Server binary not found in expected location. Trying alternative build options..."
+        
+        # Try alternative build configuration
+        cd "$LLAMA_CPP_DIR"
+        rm -rf build
+        mkdir -p build
+        cd build
+        
+        # Try with minimal options
+        print_status "yellow" "Trying minimal build configuration..."
+	print_status "yellow" "Trying build with minimal options: cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SERVER=ON"
+	cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SERVER=ON
+        cmake --build . --config Release -j$(nproc)
+    fi
+    
+    # Find the server binary
+    SERVER_PATH=""
+    for possible_path in \
+        "$LLAMA_CPP_DIR/build/bin/server" \
+        "$LLAMA_CPP_DIR/build/server" \
+        "$LLAMA_CPP_DIR/server"
+    do
+        if [ -f "$possible_path" ]; then
+            SERVER_PATH="$possible_path"
+            print_status "green" "Found server binary at: $SERVER_PATH"
+            break
+        fi
+    done
+    
+    if [ -z "$SERVER_PATH" ]; then
+        print_status "red" "Could not find server binary after build. Please check the build logs."
+        print_status "yellow" "You may need to build llama.cpp manually. See: https://github.com/ggerganov/llama.cpp/blob/master/README.md"
+        exit 1
+    fi
+    
+    # Write server path to config
+    echo "LLAMA_SERVER=\"$SERVER_PATH\"" > "$INSTALL_DIR/server_path"
+    print_status "green" "llama.cpp built successfully."
+}
+
+# Install AIBuddy CLI
+install_aibuddy() {
+    print_status "green" "Installing AIBuddy CLI..."
+    
+    # Make sure we're in the virtual environment
+    source "$INSTALL_DIR/venv/bin/activate"
+    
+    # Create AIBuddy script
+    mkdir -p "$CONFIG_DIR"
+    
+    # Create the AIBuddy Python script
+    cat > "$INSTALL_DIR/aibuddy.py" << 'EOF'
+#!/usr/bin/env python3
+# aibuddy.py - CLI Assistant using local GGUF model
+# Based on DeepSeek CLI Assistant concept
+
+import click
+import json
+import os
+import sys
+import subprocess
+import requests
+import signal
+import re
+import time
+import psutil
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple
+import shlex
+from tqdm import tqdm
+import colorama
+from colorama import Fore, Style
+
+# Initialize colorama
+colorama.init()
+
+# Configuration
+CONFIG_DIR = Path.home() / ".config" / "aibuddy"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+HISTORY_FILE = CONFIG_DIR / "history.json"
+TEMPLATES_FILE = CONFIG_DIR / "templates.json"
+MODEL_PATH = "/home/katana/projects/linux/aibuddy/agentica-org_DeepScaleR-1.5B-Preview-Q8_0.gguf"
+SERVER_PID_FILE = CONFIG_DIR / "server.pid"
+
+# Default server settings
+DEFAULT_CONFIG = {
+    "model_path": MODEL_PATH,
+    "server_host": "localhost",
+    "server_port": 8080,
+    "context_length": 4096,
+    "thread_count": 4,
+    "temperature": 0.2,
+    "max_tokens": 1024
+}
+
+# Default templates
+DEFAULT_TEMPLATES = {
+    "command": "Generate a Linux bash command that will: {description}\nProvide ONLY the command with NO explanations.",
+    "explanation": "Explain what this Linux command does in detail:\n\n{command}\n\nBreak down each part of the command, any options/flags used, and potential side effects or security considerations.",
+    "fix": "The following Linux command failed:\n\n```\n{command}\n```\n\nWith this error:\n```\n{error}\n```\n\nPlease provide a corrected version of the command that will work, and briefly explain what was wrong.",
+    "interactive": "I want to {goal}. Guide me through an interactive process to create the right command, asking questions to get the details you need."
+}
+
+def ensure_config_exists():
+    """Create config directory and files if they don't exist."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    
+    if not CONFIG_FILE.exists():
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(DEFAULT_CONFIG, f, indent=2)
+    
+    if not HISTORY_FILE.exists():
+        with open(HISTORY_FILE, "w") as f:
+            json.dump([], f)
+            
+    if not TEMPLATES_FILE.exists():
+        with open(TEMPLATES_FILE, "w") as f:
+            json.dump(DEFAULT_TEMPLATES, f, indent=2)
+
+def load_config():
+    """Load the configuration."""
+    ensure_config_exists()
+    with open(CONFIG_FILE, "r") as f:
+        return json.load(f)
+
+def load_templates():
+    """Load prompt templates."""
+    ensure_config_exists()
+    with open(TEMPLATES_FILE, "r") as f:
+        return json.load(f)
+
+def save_history(description, command, output=None):
+    """Save a command to history."""
+    try:
+        with open(HISTORY_FILE, "r") as f:
+            history = json.load(f)
+        
+        history.append({
+            "description": description, 
+            "command": command,
+            "output": output[:500] if output else None,  # Limit output size
+            "timestamp": time.time()
+        })
+        
+        # Keep only the last 100 entries
+        if len(history) > 100:
+            history = history[-100:]
+        
+        with open(HISTORY_FILE, "w") as f:
+            json.dump(history, f, indent=2)
+    except Exception as e:
+        click.echo(f"Warning: Could not save to history: {str(e)}")
+
+def find_server_binary():
+    """Find the llama.cpp server binary."""
+    # First check the saved path
+    server_path_file = Path.home() / "aibuddy" / "server_path"
+    if server_path_file.exists():
+        with open(server_path_file, "r") as f:
+            line = f.readline().strip()
+            if line.startswith("LLAMA_SERVER="):
+                server_path = line[13:].strip('"\'')
+                if os.path.isfile(server_path) and os.access(server_path, os.X_OK):
+                    return server_path
+    
+    # Check common locations
+    possible_locations = [
+        Path.home() / "llama.cpp" / "build" / "bin" / "server",
+        Path.home() / "llama.cpp" / "build" / "server",
+        Path.home() / "llama.cpp" / "server",
+        "/usr/local/bin/llama-server",
+        "/usr/local/bin/server"
+    ]
+    
+    for location in possible_locations:
+        if location.exists() and os.access(location, os.X_OK):
+            return str(location)
+    
+    # Last resort - look in path
+    for binary_name in ["llama-server", "server"]:
+        try:
+            result = subprocess.run(["which", binary_name], capture_output=True, text=True)
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except:
+            pass
+    
+    # Really last resort - search for it
+    try:
+        for llama_dir in [Path.home() / "llama.cpp"]:
+            if llama_dir.exists():
+                for root, dirs, files in os.walk(llama_dir):
+                    for file in files:
+                        if file == "server" or file == "llama-server":
+                            full_path = os.path.join(root, file)
+                            if os.access(full_path, os.X_OK):
+                                return full_path
+    except:
+        pass
+    
+    return None
+
+def is_server_running(host, port):
+    """Check if the server is running."""
+    try:
+        response = requests.get(f"http://{host}:{port}/health", timeout=2)
+        return response.status_code == 200
+    except:
+        # Also check if we have a PID file and the process is running
+        if SERVER_PID_FILE.exists():
+            try:
+                with open(SERVER_PID_FILE, "r") as f:
+                    pid = int(f.read().strip())
+                if psutil.pid_exists(pid):
+                    # Process exists, but server not responding - kill it
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                        time.sleep(2)
+                        if psutil.pid_exists(pid):
+                            os.kill(pid, signal.SIGKILL)
+                    except:
+                        pass
+            except:
+                pass
+            # Remove the stale PID file
+            try:
+                SERVER_PID_FILE.unlink()
+            except:
+                pass
+        return False
+
+def stop_server():
+    """Stop the running server if it exists."""
+    if SERVER_PID_FILE.exists():
+        try:
+            with open(SERVER_PID_FILE, "r") as f:
+                pid = int(f.read().strip())
+            if psutil.pid_exists(pid):
+                click.echo(f"Stopping server (PID: {pid})...")
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    # Wait for the process to terminate
+                    for _ in range(5):
+                        if not psutil.pid_exists(pid):
+                            break
+                        time.sleep(1)
+                    # Force kill if it didn't terminate
+                    if psutil.pid_exists(pid):
+                        os.kill(pid, signal.SIGKILL)
+                except:
+                    click.echo("Failed to stop server process.")
+        except:
+            click.echo("Failed to read server PID.")
+    
+    # Remove the PID file
+    try:
+        SERVER_PID_FILE.unlink(missing_ok=True)
+    except:
+        pass
+
+def call_llm_api(prompt, config):
+    """Call the local LLM API with the given prompt."""
+    host = config.get("server_host", "localhost")
+    port = config.get("server_port", 8080)
+    
+    # Check if server is running
+    if not is_server_running(host, port):
+        click.echo("Server is not running. Starting server...")
+        # Start the server in the background
+        start_server(config)
+        
+        # Wait for server to start with progress bar
+        with tqdm(total=20, desc="Starting server", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}") as pbar:
+            for _ in range(20):
+                if is_server_running(host, port):
+                    break
+                time.sleep(1)
+                pbar.update(1)
+            else:
+                click.echo(f"{Fore.RED}Failed to start server. Check logs at {CONFIG_DIR}/server.log{Style.RESET_ALL}")
+                return None
+
+    # Format messages for API
+    messages = [
+        {"role": "system", "content": "You are an expert Linux command line assistant. Generate accurate, secure commands for user requests."},
+        {"role": "user", "content": prompt}
+    ]
+    
+    # Make API request with progress indication
+    click.echo("Waiting for response from model...")
+    try:
+        response = requests.post(
+            f"http://{host}:{port}/v1/chat/completions",
+            json={
+                "model": "local-model",
+                "messages": messages,
+                "temperature": float(config.get("temperature", 0.2)),
+                "max_tokens": int(config.get("max_tokens", 1024))
+            },
+            timeout=60
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result["choices"][0]["message"]["content"]
+        else:
+            click.echo(f"{Fore.RED}Error: API returned status code {response.status_code}{Style.RESET_ALL}")
+            if response.text:
+                click.echo(f"Response: {response.text[:200]}...")
+            return None
+    except Exception as e:
+        click.echo(f"{Fore.RED}Error calling API: {str(e)}{Style.RESET_ALL}")
+        return None
+
+def start_server(config):
+    """Start the LLM server in the background."""
+    # First stop any existing server
+    stop_server()
+    
+    model_path = config.get("model_path", MODEL_PATH)
+    port = config.get("server_port", 8080)
+    
+    if not os.path.exists(model_path):
+        click.echo(f"{Fore.RED}Error: Model not found at {model_path}{Style.RESET_ALL}")
+        sys.exit(1)
+    
+    # Find server binary
+    server_binary = find_server_binary()
+    if not server_binary:
+        click.echo(f"{Fore.RED}Error: llama.cpp server binary not found. Please build llama.cpp first.{Style.RESET_ALL}")
+        sys.exit(1)
+    
+    click.echo(f"Using server binary: {server_binary}")
+    
+    # Create a script to start the server
+    server_script = CONFIG_DIR / "start_server.sh"
+    with open(server_script, "w") as f:
+        f.write(f"""#!/bin/bash
+SERVER_LOG="{CONFIG_DIR}/server.log"
+echo "Starting server at $(date)" > "$SERVER_LOG"
+
+# Start the server
+"{server_binary}" \\
+    --model "{model_path}" \\
+    --port {port} \\
+    --threads {config.get("thread_count", 4)} \\
+    --ctx-size {config.get("context_length", 4096)} \\
+    --host {config.get("server_host", "127.0.0.1")} \\
+    >> "$SERVER_LOG" 2>&1 &
+
+# Save PID
+echo $! > "{SERVER_PID_FILE}"
+echo "Server started with PID $! at $(date)" >> "$SERVER_LOG"
+""")
+    
+    os.chmod(server_script, 0o755)
+    try:
+        subprocess.run([str(server_script)], shell=True, check=True)
+        click.echo(f"Server starting in background. Log: {CONFIG_DIR}/server.log")
+    except subprocess.CalledProcessError as e:
+        click.echo(f"{Fore.RED}Failed to start server: {str(e)}{Style.RESET_ALL}")
+        sys.exit(1)
+
+def extract_command_from_response(response):
+    """Extract just the command from a model response."""
+    if not response:
+        return None
+        
+    # Try to extract just the command
+    command = response.strip()
+    
+    # Remove code block formatting if present
+    code_block_match = re.search(r'```(?:bash|shell)?\s*([\s\S]*?)\s*```', command)
+    if code_block_match:
+        command = code_block_match.group(1).strip()
+        return command
+    
+    # If no code block, look for command-like lines
+    lines = command.split('\n')
+    command_lines = []
+    for line in lines:
+        line = line.strip()
+        # Skip non-command lines (explanations, etc.)
+        if line and not line.startswith('#') and not re.match(r'^[A-Z][a-z]', line):
+            command_lines.append(line)
+    
+    if command_lines:
+        return command_lines[0]
+    
+    return command  # Return the original if nothing better found
+
+def execute_command(command):
+    """Execute a command and return its output."""
+    try:
+        # Display the command for transparency
+        click.echo(f"\n{Fore.CYAN}Executing: {command}{Style.RESET_ALL}\n")
+        
+        # Get confirmation if command is potentially dangerous
+        danger_patterns = [
+            r'\brm\b.*(-rf?|--recursive)',
+            r'\bsudo\b',
+            r'\bdd\b',
+            r'\bmkfs\b',
+            r'> */dev/',
+            r'\bchmod\b.*777',
+            r'\breboot\b',
+            r'\bshutdown\b',
+            r'\biptables\b',
+            r'\bmv\b.*(/|~)',
+            r';.*\brm\b'
+        ]
+        
+        is_dangerous = False
+        for pattern in danger_patterns:
+            if re.search(pattern, command):
+                is_dangerous = True
+                break
+                
+        if is_dangerous:
+            click.echo(f"{Fore.YELLOW}⚠️  Warning: This command may modify your system.{Style.RESET_ALL}")
+            if not click.confirm("Proceed?"):
+                return "Command execution cancelled by user."
+        
+        # Execute command
+        result = subprocess.run(
+            command, 
+            shell=True, 
+            text=True, 
+            capture_output=True
+        )
+        
+        output = result.stdout
+        if result.stderr:
+            if result.returncode != 0:
+                output += f"\n{Fore.RED}Errors:{Style.RESET_ALL}\n" + result.stderr
+            else:
+                output += f"\n{Fore.YELLOW}Messages:{Style.RESET_ALL}\n" + result.stderr
+        
+        return output
+    except Exception as e:
+        return f"{Fore.RED}Error executing command: {str(e)}{Style.RESET_ALL}"
+
+def fix_command_errors(error_text, original_command):
+    """Use the LLM to fix errors in a command."""
+    config = load_config()
+    templates = load_templates()
+    
+    prompt = templates.get("fix", DEFAULT_TEMPLATES["fix"]).format(
+        command=original_command,
+        error=error_text
+    )
+    
+    response = call_llm_api(prompt, config)
+    if response:
+        click.echo(f"\n{response}\n")
+        
+        # Try to extract the fixed command
+        command_lines = []
+        in_code_block = False
+        for line in response.split('\n'):
+            line_stripped = line.strip()
+            if line_stripped.startswith('```') and '```' in line_stripped:
+                # Single line code block
+                code = line_stripped.replace('```', '').strip()
+                if code:
+                    command_lines.append(code)
+                continue
+            if line_stripped.startswith('```'):
+                in_code_block = not in_code_block
+                continue
+            if in_code_block and line_stripped and not line_stripped.startswith('#'):
+                command_lines.append(line.rstrip())
+        
+        if command_lines:
+            fixed_command = command_lines[0]
+            if click.confirm(f"Would you like to execute the fixed command?\n{Fore.CYAN}{fixed_command}{Style.RESET_ALL}"):
+                output = execute_command(fixed_command)
+                save_history(f"Fixed: {original_command}", fixed_command, output)
+                return output
+    
+    return None
+
+def interactive_command_building(goal):
+    """Build a command interactively by asking questions."""
+    config = load_config()
+    templates = load_templates()
+    
+    prompt = templates.get("interactive", DEFAULT_TEMPLATES["interactive"]).format(goal=goal)
+    
+    click.echo(f"{Fore.GREEN}Starting interactive command building for: {goal}{Style.RESET_ALL}\n")
+    
+    # Keep track of conversation
+    conversation = [
+        {"role": "system", "content": "You are an expert Linux command line assistant helping a user build a command interactively. Ask clarifying questions one at a time to gather necessary information."},
+        {"role": "user", "content": prompt}
+    ]
+    
+    final_command = None
+    
+    # Interactive loop
+    while True:
+        # Get AI response
+        host = config.get("server_host", "localhost")
+        port = config.get("server_port", 8080)
+        
+        if not is_server_running(host, port):
+            start_server(config)
+            time.sleep(2)
+        
+        try:
+            response = requests.post(
+                f"http://{host}:{port}/v1/chat/completions",
+                json={
+                    "model": "local-model",
+                    "messages": conversation,
+                    "temperature": float(config.get("temperature", 0.2)),
+                    "max_tokens": int(config.get("max_tokens", 1024))
+                },
+                timeout=60
+            )
+            
+            if response.status_code != 200:
+                click.echo(f"{Fore.RED}Error: API returned status code {response.status_code}{Style.RESET_ALL}")
+                return None
+                
+            result = response.json()
+            ai_message = result["choices"][0]["message"]["content"]
+            
+            # Add the message to conversation
+            conversation.append({"role": "assistant", "content": ai_message})
+            
+            # Check if this includes a final command recommendation
+            code_block_match = re.search(r'```(?:bash|shell)?\s*([\s\S]*?)\s*```', ai_message)
+            if code_block_match and ("final command" in ai_message.lower() or 
+                                    "recommended command" in ai_message.lower() or
+                                    "here's the command" in ai_message.lower()):
+                final_command = code_block_match.group(1).strip()
+            
+            # Display AI message
+            click.echo(f"\n{Fore.GREEN}Assistant:{Style.RESET_ALL} {ai_message}\n")
+            
+            # Check if we have a final command or a clear question
+            if final_command:
+                if click.confirm(f"Would you like to execute this command?\n{Fore.CYAN}{final_command}{Style.RESET_ALL}"):
+                    output = execute_command(final_command)
+                    click.echo(output)
+                    save_history(goal, final_command, output)
+                    return output
+                else:
+                    user_input = click.prompt(f"{Fore.BLUE}Do you want to continue refining the command or exit? (refine/exit){Style.RESET_ALL}")
+                    if user_input.lower() in ("exit", "quit", "done"):
+                        return final_command
+                    final_command = None  # Reset so we can continue refining
+            
+            # Get user's response
+            user_input = click.prompt(f"{Fore.BLUE}Your response{Style.RESET_ALL}")
+            if user_input.lower() in ("exit", "quit", "done"):
+                break
+            
+            # Add to conversation
+            conversation.append({"role": "user", "content": user_input})
+            
+        except Exception as e:
+            click.echo(f"{Fore.RED}Error during interactive session: {str(e)}{Style.RESET_ALL}")
+            break
+    
+    return final_command
+
+@click.group()
+def cli():
+    """AIBuddy CLI Assistant - Help with Linux commands."""
+    ensure_config_exists()
+
+@cli.command()
+@click.argument("description")
+@click.option("--execute", "-e", is_flag=True, help="Execute the generated command")
+@click.option("--interactive", "-i", is_flag=True, help="Build the command interactively")
+@click.option("--verbose", "-v", is_flag=True, help="Show full response with explanation")
+def generate(description, execute, interactive, verbose):
+    """Generate a command from a natural language description."""
+    config = load_config()
+    templates = load_templates()
+    
+    if interactive:
+        final_command = interactive_command_building(description)
+        if final_command and not execute:
+            click.echo(f"\n{Fore.GREEN}Final Command:{Style.RESET_ALL}")
+            click.echo(f"{Fore.CYAN}{final_command}{Style.RESET_ALL}\n")
+            save_history(description, final_command)
+        return
+    
+    click.echo("Generating command...")
+    
+    if verbose:
+        prompt = f"Generate a Linux bash command that will: {description}\nExplain how the command works."
+    else:
+        prompt = templates.get("command", DEFAULT_TEMPLATES["command"]).format(description=description)
+    
+    response = call_llm_api(prompt, config)
+    
+    if response:
+        if verbose:
+            # Show full response with code formatting
+            formatted_response = response
+            # Highlight code blocks
+            formatted_response = re.sub(
+                r'```(.*?)```', 
+                lambda m: f"{Fore.CYAN}{m.group(0)}{Style.RESET_ALL}", 
+                formatted_response, 
+                flags=re.DOTALL
+            )
+            click.echo(f"\n{formatted_response}\n")
+            
+            # Extract command for execution
+            command = extract_command_from_response(response)
+        else:
+            # Extract just the command
+            command = extract_command_from_response(response)
+            
+            if command:
+                click.echo(f"\n{Fore.GREEN}Generated Command:{Style.RESET_ALL}")
+                click.echo(f"{Fore.CYAN}{command}{Style.RESET_ALL}\n")
+        
+        if command:
+            # Save to history
+            save_history(description, command)
+            
+            # Execute if requested
+            if execute:
+                output = execute_command(command)
+                click.echo(f"{Fore.GREEN}Output:{Style.RESET_ALL}")
+                click.echo(output)
+                
+                # Save output to history
+                save_history(description, command, output)
+                
+                # If there's an error, offer to fix it
+                if ("error" in output.lower() or 
+                    "not found" in output.lower() or 
+                    "command not found" in output.lower()):
+                    if click.confirm("Would you like me to try to fix any errors in this command?"):
+                        fix_command_errors(output, command)
+        else:
+            click.echo(f"{Fore.YELLOW}Could not extract a clear command from the response.{Style.RESET_ALL}")
+    else:
+        click.echo(f"{Fore.RED}Failed to generate command.{Style.RESET_ALL}")
+
+@cli.command()
+@click.argument("command", nargs=-1)
+def explain(command):
+    """Explain what a command does."""
+    config = load_config()
+    templates = load_templates()
+    
+    # Join arguments into a single command string
+    cmd_str = " ".join(command)
+    
+    click.echo(f"{Fore.GREEN}Analyzing command: {cmd_str}{Style.RESET_ALL}")
+    prompt = templates.get("explanation", DEFAULT_TEMPLATES["explanation"]).format(command=cmd_str)
+    
+    response = call_llm_api(prompt, config)
+    
+    if response:
+        # Format the response with some highlighting
+        formatted_response = response
+        # Highlight command parts with cyan
+        formatted_response = re.sub(
+            r'`([^`]+)`', 
+            lambda m: f"{Fore.CYAN}{m.group(1)}{Style.RESET_ALL}", 
+            formatted_response
+        )
+        # Highlight warnings with yellow
+        formatted_response = re.sub(
+            r'(?i)(warning|caution|careful|danger|attention)(!?:?)',
+            lambda m: f"{Fore.YELLOW}{m.group(0)}{Style.RESET_ALL}",
+            formatted_response
+        )
+        click.echo(f"\n{formatted_response}")
+    else:
+        click.echo(f"{Fore.RED}Failed to analyze command.{Style.RESET_ALL}")
+
+@cli.command()
+@click.argument("command", nargs=-1)
+def fix(command):
+    """Try to fix errors in a command."""
+    config = load_config()
+    
+    # Join arguments into a single command string
+    cmd_str = " ".join(command)
+    
+    click.echo(f"{Fore.GREEN}Attempting to execute command first to see if it has errors...{Style.RESET_ALL}")
+    output = execute_command(cmd_str)
+    
+    if ("error" in output.lower() or 
+        "not found" in output.lower() or 
+        "command not found" in output.lower() or
+        "no such file" in output.lower()):
+        click.echo(f"{Fore.RED}Command had errors:{Style.RESET_ALL}")
+        click.echo(output)
+        click.echo(f"\n{Fore.GREEN}Attempting to fix the command...{Style.RESET_ALL}")
+        
+        fixed_output = fix_command_errors(output, cmd_str)
+        if fixed_output:
+            click.echo(f"\n{Fore.GREEN}Output from fixed command:{Style.RESET_ALL}")
+            click.echo(fixed_output)
+    else:
+        click.echo(f"{Fore.GREEN}Command executed successfully:{Style.RESET_ALL}")
+        click.echo(output)
+        save_history("Direct execution", cmd_str, output)
+
+@cli.command()
+@click.option("--full", "-f", is_flag=True, help="Show full history including output")
+@click.option("--limit", "-l", type=int, default=10, help="Number of entries to show (default: 10)")
+def history(full, limit):
+    """Show command history."""
+    try:
+        with open(HISTORY_FILE, "r") as f:
+            history = json.load(f)
+    except:
+        click.echo(f"{Fore.RED}No command history found or file is corrupted.{Style.RESET_ALL}")
+        return
+    
+    if not history:
+        click.echo("No command history found.")
+        return
+    
+    click.echo(f"{Fore.GREEN}Command History:{Style.RESET_ALL}")
+    
+    # Sort by timestamp if available
+    history.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
+    
+    for i, entry in enumerate(history[:limit], 1):
+        timestamp = entry.get('timestamp', 0)
+        if timestamp:
+            time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+            click.echo(f"{i}. [{time_str}] \"{entry['description']}\"")
+        else:
+            click.echo(f"{i}. \"{entry['description']}\"")
+            
+        click.echo(f"{Fore.CYAN}   {entry['command']}{Style.RESET_ALL}")
+        
+        if full and entry.get('output'):
+            click.echo(f"{Fore.YELLOW}   Output (truncated):{Style.RESET_ALL}")
+            click.echo(f"   {entry['output']}")
+        
+        click.echo()
+    
+    # Option to execute a command from history
+    if history and click.confirm("Would you like to execute a command from history?"):
+        idx = click.prompt("Enter the number of the command to execute", type=int)
+        if 1 <= idx <= len(history[:limit]):
+            cmd = history[idx-1]['command']
+            click.echo(f"Executing: {cmd}")
+            output = execute_command(cmd)
+            click.echo(output)
+
+@cli.command()
+def config():
+    """Configure the AIBuddy CLI Assistant."""
+    current_config = load_config()
+    
+    click.echo(f"{Fore.GREEN}Current configuration:{Style.RESET_ALL}")
+    for key, value in current_config.items():
+        click.echo(f"{key}: {value}")
+    
+    if click.confirm("Would you like to update the configuration?"):
+        # Model path
+        model_path = click.prompt("Model path", default=current_config.get("model_path", MODEL_PATH))
+        
+        # Server settings
+        server_host = click.prompt("Server host", default=current_config.get("server_host", "localhost"))
+        server_port = click.prompt("Server port", default=current_config.get("server_port", 8080), type=int)
+        
+        # Performance settings
+        thread_count = click.prompt("Thread count", default=current_config.get("thread_count", 4), type=int)
+        context_length = click.prompt("Context length", default=current_config.get("context_length", 4096), type=int)
+        
+        # Generation settings
+        temperature = click.prompt("Temperature (0.0-1.0)", default=current_config.get("temperature", 0.2), type=float)
+        max_tokens = click.prompt("Max tokens", default=current_config.get("max_tokens", 1024), type=int)
+        
+        # Update config
+        new_config = {
+            "model_path": model_path,
+            "server_host": server_host,
+            "server_port": server_port,
+            "thread_count": thread_count,
+            "context_length": context_length,
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        }
+        
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(new_config, f, indent=2)
+        
+        click.echo(f"{Fore.GREEN}Configuration updated!{Style.RESET_ALL}")
+        
+        # Ask if user wants to edit templates
+        if click.confirm("Would you like to edit prompt templates?"):
+            templates = load_templates()
+            
+            click.echo(f"\n{Fore.GREEN}Templates control how AIBuddy communicates with the model.{Style.RESET_ALL}")
+            click.echo("Available template variables:")
+            click.echo("  {description} - For the command description")
+            click.echo("  {command} - For the command string")
+            click.echo("  {error} - For error messages")
+            click.echo("  {goal} - For interactive command building goal")
+            
+            for key, value in templates.items():
+                click.echo(f"\n{Fore.YELLOW}Template: {key}{Style.RESET_ALL}")
+                click.echo(value)
+                if click.confirm(f"Edit this template?"):
+                    new_value = click.edit(value)
+                    if new_value:
+                        templates[key] = new_value.strip()
+            
+            with open(TEMPLATES_FILE, "w") as f:
+                json.dump(templates, f, indent=2)
+            
+            click.echo(f"{Fore.GREEN}Templates updated!{Style.RESET_ALL}")
+
+@cli.command()
+@click.option("--start", is_flag=True, help="Start the server")
+@click.option("--stop", is_flag=True, help="Stop the server")
+@click.option("--restart", is_flag=True, help="Restart the server")
+@click.option("--status", is_flag=True, help="Check server status")
+def server(start, stop, restart, status):
+    """Manage the LLM server."""
+    config = load_config()
+    host = config.get("server_host", "localhost")
+    port = config.get("server_port", 8080)
+    
+    if restart:
+        click.echo(f"{Fore.YELLOW}Restarting server...{Style.RESET_ALL}")
+        stop_server()
+        time.sleep(1)
+        start_server(config)
+        return
+        
+    if stop:
+        if is_server_running(host, port):
+            click.echo(f"{Fore.YELLOW}Stopping server...{Style.RESET_ALL}")
+            stop_server()
+            click.echo(f"{Fore.GREEN}Server stopped.{Style.RESET_ALL}")
+        else:
+            click.echo("Server is not running.")
+        return
+        
+    if start:
+        if is_server_running(host, port):
+            click.echo(f"Server is already running at http://{host}:{port}")
+            if click.confirm("Would you like to restart it?"):
+                stop_server()
+                time.sleep(1)
+                start_server(config)
+        else:
+            click.echo(f"{Fore.YELLOW}Starting server...{Style.RESET_ALL}")
+            start_server(config)
+        return
+    
+    # Default to status if no options specified
+    if is_server_running(host, port):
+        click.echo(f"{Fore.GREEN}Server is running at http://{host}:{port}{Style.RESET_ALL}")
+        
+        # Check if we have a PID file
+        if SERVER_PID_FILE.exists():
+            try:
+                with open(SERVER_PID_FILE, "r") as f:
+                    pid = int(f.read().strip())
+                click.echo(f"Server process ID: {pid}")
+                
+                # Show some basic process info
+                if psutil.pid_exists(pid):
+                    try:
+                        process = psutil.Process(pid)
+                        memory_info = process.memory_info()
+                        click.echo(f"Memory usage: {memory_info.rss / (1024 * 1024):.1f} MB")
+                        click.echo(f"CPU usage: {process.cpu_percent(interval=0.1):.1f}%")
+                        click.echo(f"Running since: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(process.create_time()))}")
+                    except:
+                        pass
+            except:
+                pass
+            
+        if not (start or stop or restart):
+            options = ["restart", "stop", "view logs", "do nothing"]
+            action = click.prompt(
+                "What would you like to do?",
+                type=click.Choice(options),
+                default="do nothing"
+            )
+            
+            if action == "restart":
+                stop_server()
+                time.sleep(1)
+                start_server(config)
+            elif action == "stop":
+                stop_server()
+                click.echo(f"{Fore.GREEN}Server stopped.{Style.RESET_ALL}")
+            elif action == "view logs":
+                log_file = CONFIG_DIR / "server.log"
+                if log_file.exists():
+                    try:
+                        # Show last 20 lines
+                        with open(log_file, "r") as f:
+                            lines = f.readlines()
+                            click.echo(f"\n{Fore.YELLOW}Last 20 lines of server log:{Style.RESET_ALL}")
+                            for line in lines[-20:]:
+                                click.echo(line.rstrip())
+                    except:
+                        click.echo(f"{Fore.RED}Could not read log file.{Style.RESET_ALL}")
+                else:
+                    click.echo(f"{Fore.RED}No log file found.{Style.RESET_ALL}")
+    else:
+        click.echo(f"{Fore.YELLOW}Server is not running.{Style.RESET_ALL}")
+        if click.confirm("Would you like to start the server?"):
+            start_server(config)
+
+@cli.command()
+@click.argument("goal")
+def interactive(goal):
+    """Build a command interactively for a specific goal."""
+    interactive_command_building(goal)
+
+@cli.command()
+@click.option("--show-logs", is_flag=True, help="Show log files content")
+def logs(show_logs):
+    """View AIBuddy logs."""
+    log_files = {
+        "Server Log": CONFIG_DIR / "server.log",
+        "Setup Log": Path.home() / "aibuddy_setup.log"
+    }
+    
+    click.echo(f"{Fore.GREEN}Available logs:{Style.RESET_ALL}")
+    for name, path in log_files.items():
+        if path.exists():
+            size = path.stat().st_size / 1024  # Size in KB
+            modified = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(path.stat().st_mtime))
+            click.echo(f"{name}: {path} ({size:.1f} KB, last modified: {modified})")
+        else:
+            click.echo(f"{name}: {path} (file not found)")
+    
+    if show_logs:
+        for name, path in log_files.items():
+            if path.exists():
+                try:
+                    with open(path, "r") as f:
+                        content = f.readlines()
+                        click.echo(f"\n{Fore.YELLOW}=== {name} (last 20 lines) ==={Style.RESET_ALL}")
+                        for line in content[-20:]:
+                            click.echo(line.rstrip())
+                        click.echo()
+                except Exception as e:
+                    click.echo(f"{Fore.RED}Error reading {name}: {str(e)}{Style.RESET_ALL}")
+
+if __name__ == "__main__":
+    cli()
+EOF
+    
+    # Make script executable
+    chmod +x "$INSTALL_DIR/aibuddy.py"
+    
+    # Create default configuration
+    mkdir -p "$CONFIG_DIR"
+    if [ ! -f "$CONFIG_DIR/config.json" ]; then
+        cat > "$CONFIG_DIR/config.json" << EOF
+{
+    "model_path": "$MODEL_PATH",
+    "server_host": "localhost",
+    "server_port": ${DEFAULT_PORT},
+    "context_length": 4096,
+    "thread_count": 4,
+    "temperature": 0.2,
+    "max_tokens": 1024
+}
+EOF
+    fi
+    
+    # Create empty history file
+    if [ ! -f "$CONFIG_DIR/history.json" ]; then
+        echo "[]" > "$CONFIG_DIR/history.json"
+    fi
+    
+    # Create templates file
+    if [ ! -f "$CONFIG_DIR/templates.json" ]; then
+        cat > "$CONFIG_DIR/templates.json" << 'EOF'
+{
+    "command": "Generate a Linux bash command that will: {description}\nProvide ONLY the command with NO explanations.",
+    "explanation": "Explain what this Linux command does in detail:\n\n{command}\n\nBreak down each part of the command, any options/flags used, and potential side effects or security considerations.",
+    "fix": "The following Linux command failed:\n\n```\n{command}\n```\n\nWith this error:\n```\n{error}\n```\n\nPlease provide a corrected version of the command that will work, and briefly explain what was wrong.",
+    "interactive": "I want to {goal}. Guide me through an interactive process to create the right command, asking questions to get the details you need."
+}
+EOF
+    fi
+    
+    # Create wrapper script
+    cat > "$INSTALL_DIR/aibuddy" << EOF
+#!/bin/bash
+# Wrapper script for AIBuddy CLI
+
+# Activate virtual environment
+source "$INSTALL_DIR/venv/bin/activate"
+
+# Run the Python script
+"$INSTALL_DIR/aibuddy.py" "\$@"
+EOF
+    
+    chmod +x "$INSTALL_DIR/aibuddy"
+    
+    # Create symlink to PATH
+    mkdir -p "$HOME/.local/bin"
+    ln -sf "$INSTALL_DIR/aibuddy" "$HOME/.local/bin/aibuddy"
+    
+    print_status "green" "AIBuddy CLI installed at: $HOME/.local/bin/aibuddy"
+    
+    # Add to PATH if needed
+    if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+        print_status "yellow" "Please add $HOME/.local/bin to your PATH:"
+        echo 'export PATH="$HOME/.local/bin:$PATH"'
+    fi
+}
+
+# Create quick start guide
+create_docs() {
+    print_status "green" "Creating documentation..."
+    
+    mkdir -p "$INSTALL_DIR/docs"
+    
+    cat > "$INSTALL_DIR/docs/README.md" << 'EOF'
+# AIBuddy CLI Assistant
+
+AIBuddy is a command-line assistant for Linux that helps you generate, explain, and fix shell commands using a local language model.
+
+## Features
+
+- **Command Generation**: Generate shell commands from natural language descriptions
+- **Command Explanation**: Get detailed explanations of what commands do
+- **Error Resolution**: Automatically fix common command errors
+- **Interactive Mode**: Guided command building through conversation
+- **Command History**: Keep track of generated commands
+- **Self-hosting**: All processing happens locally using your own model
+
+## Usage
+
+```bash
+# Generate a command from a description
+aibuddy generate "find all PDF files modified in the last 7 days"
+
+# Generate and execute a command
+aibuddy generate -e "create a backup of my home directory"
+
+# Generate with detailed explanation
+aibuddy generate -v "sort a CSV file by the second column"
+
+# Build a command interactively
+aibuddy generate -i "set up a cron job to clean tmp files"
+# Or use the dedicated command
+aibuddy interactive "configure nginx for my website"
+
+# Explain a command
+aibuddy explain "find / -type f -name '*.pdf' -mtime -7"
+
+# Fix a command that has errors
+aibuddy fix "grpe -r 'error' /var/log/"
+
+# View command history
+aibuddy history
+aibuddy history --full  # Show output too
+
+# Configure server settings
+aibuddy config
+
+# Manage the LLM server
+aibuddy server --start
+aibuddy server --stop
+aibuddy server --status
+
+# View logs
+aibuddy logs --show-logs
+```
+
+## Requirements
+
+- Python 3.8 or newer
+- llama.cpp (built with CMake)
+- GGUF model file
+
+## Troubleshooting
+
+If you encounter issues:
+
+1. Check the server logs: `aibuddy logs --show-logs`
+2. Make sure the model file exists and is correctly configured
+3. Verify that llama.cpp is properly installed
+4. Try restarting the server: `aibuddy server --restart`
+
+For more help, run any command with `--help`.
+EOF
+    
+    print_status "green" "Documentation created at: $INSTALL_DIR/docs/README.md"
+}
+
+# Print final instructions
+print_instructions() {
+    echo
+    echo "┌───────────────────────────────────────────────┐"
+    echo "│                                               │"
+    echo "│            AIBuddy Setup Complete!            │"
+    echo "│                                               │"
+    echo "└───────────────────────────────────────────────┘"
+    echo
+    echo "Installation directory: $INSTALL_DIR"
+    echo
+    echo "To use AIBuddy CLI Assistant:"
+    echo "  aibuddy generate \"find all text files in my home directory\""
+    echo "  aibuddy explain \"find ~ -type f -name '*.txt'\""
+    echo "  aibuddy fix \"grpe -r 'error' /var/log/\""
+    echo "  aibuddy interactive \"set up a web server\""
+    echo
+    echo "To start the server:"
+    echo "  aibuddy server --start"
+    echo
+    echo "To check server status:"
+    echo "  aibuddy server --status"
+    echo
+    echo "To configure AIBuddy:"
+    echo "  aibuddy config"
+    echo
+    echo "Documentation:"
+    echo "  $INSTALL_DIR/docs/README.md"
+    echo
+    echo "If you need to add to your PATH:"
+    echo 'export PATH="$HOME/.local/bin:$PATH"'
+    echo
+    echo "Setup log has been saved to: $LOG_FILE"
+    echo
+}
+
+# Main execution
+print_status "green" "Starting AIBuddy setup..."
+
+# Run setup in order
+check_system
+setup_venv
+install_dependencies
+build_llama_cpp
+install_aibuddy
+create_docs
+print_instructions
