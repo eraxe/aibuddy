@@ -1,7 +1,7 @@
 #!/bin/bash
 # setup_aibuddy.sh - Installation script for AIBuddy CLI Assistant
-# Uses local GGUF model file with CMake-based llama.cpp build
-# Updated for latest llama.cpp version with proper CUDA flags
+# Uses local GGUF model file with proper server detection
+# Modified to use system-installed llama-server from chaotic-aur
 
 set -e # Exit on any error
 
@@ -57,22 +57,33 @@ check_system() {
         fi
     fi
     
-    # Check for CMake (required for llama.cpp)
-    if ! command -v cmake &> /dev/null; then
-        print_status "yellow" "CMake not found. Installing..."
-        if command -v apt-get &> /dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y cmake
-        elif command -v pacman &> /dev/null; then
-            sudo pacman -S cmake
-        elif command -v dnf &> /dev/null; then
-            sudo dnf install -y cmake
+    # Check for llama-server (from chaotic-aur or elsewhere)
+    LLAMA_SERVER_PATH=""
+    if command -v llama-server &> /dev/null; then
+        LLAMA_SERVER_PATH=$(which llama-server)
+        print_status "green" "Found llama-server at: $LLAMA_SERVER_PATH"
         else
-            print_status "red" "Could not install CMake. Please install it manually."
-            exit 1
+        # Check some common locations for Arch Linux packages
+        for path in "/usr/bin/llama-server" "/usr/local/bin/llama-server" "/opt/llama-cpp/bin/llama-server"; do
+            if [ -f "$path" ] && [ -x "$path" ]; then
+                LLAMA_SERVER_PATH="$path"
+                print_status "green" "Found llama-server at: $LLAMA_SERVER_PATH"
+                break
+            fi
+        done
+
+        if [ -z "$LLAMA_SERVER_PATH" ]; then
+            print_status "yellow" "llama-server not found in PATH or common locations."
+            print_status "yellow" "Will attempt to use local build or build it if necessary."
         fi
     fi
     
+    # Save the server path for later use
+    if [ -n "$LLAMA_SERVER_PATH" ]; then
+        mkdir -p "$INSTALL_DIR"
+        echo "LLAMA_SERVER=\"$LLAMA_SERVER_PATH\"" > "$INSTALL_DIR/server_path"
+    fi
+
     # Check if model exists
     if [ ! -f "$MODEL_PATH" ]; then
         print_status "red" "Model not found at $MODEL_PATH."
@@ -88,7 +99,8 @@ check_system() {
         print_status "green" "Found model at $MODEL_PATH"
     fi
     
-    # Check for build essentials
+    # Check for build essentials (only needed if we need to build llama.cpp)
+    if [ -z "$LLAMA_SERVER_PATH" ]; then
     if ! command -v g++ &> /dev/null; then
         print_status "yellow" "Build tools not found. Installing..."
         if command -v apt-get &> /dev/null; then
@@ -103,7 +115,23 @@ check_system() {
             exit 1
         fi
     fi
-    
+
+        # Check for CMake (required for llama.cpp)
+        if ! command -v cmake &> /dev/null; then
+            print_status "yellow" "CMake not found. Installing..."
+            if command -v apt-get &> /dev/null; then
+                sudo apt-get update
+                sudo apt-get install -y cmake
+            elif command -v pacman &> /dev/null; then
+                sudo pacman -S cmake
+            elif command -v dnf &> /dev/null; then
+                sudo dnf install -y cmake
+            else
+                print_status "red" "Could not install CMake. Please install it manually."
+                exit 1
+            fi
+        fi
+
     # Check for git
     if ! command -v git &> /dev/null; then
         print_status "yellow" "Git not found. Installing..."
@@ -119,7 +147,8 @@ check_system() {
             exit 1
         fi
     fi
-    
+    fi
+
     # Check ports
     if command -v lsof &> /dev/null; then
         if lsof -i:8080 &>/dev/null; then
@@ -180,14 +209,21 @@ install_dependencies() {
     pip install --upgrade click requests colorama tqdm psutil
 }
 
-# Build llama.cpp with CMake
+# Build llama.cpp with CMake - only if necessary
 build_llama_cpp() {
+    # Check if we already found a system-installed server
+    if [ -f "$INSTALL_DIR/server_path" ]; then
+        print_status "green" "Using system-installed llama-server. Skipping build."
+        return 0
+    fi
+
+    print_status "green" "System-installed llama-server not found. Building llama.cpp..."
+
 # Completely remove any existing build to avoid cached configuration
 if [ -d "$LLAMA_CPP_DIR/build" ]; then
     print_status "yellow" "Removing existing build directory to avoid cached configurations"
     rm -rf "$LLAMA_CPP_DIR/build"
 fi
-    print_status "green" "Building llama.cpp with CMake..."
     
     # Clone llama.cpp if it doesn't exist
     if [ ! -d "$LLAMA_CPP_DIR" ]; then
@@ -375,50 +411,74 @@ def save_history(description, command, output=None):
 
 def find_server_binary():
     """Find the llama.cpp server binary."""
-    # First check the saved path
-    server_path_file = Path.home() / "aibuddy" / "server_path"
-    if server_path_file.exists():
-        with open(server_path_file, "r") as f:
-            line = f.readline().strip()
-            if line.startswith("LLAMA_SERVER="):
-                server_path = line[13:].strip('"\'')
-                if os.path.isfile(server_path) and os.access(server_path, os.X_OK):
-                    return server_path
-    
-    # Check common locations
-    possible_locations = [
-        Path.home() / "llama.cpp" / "build" / "bin" / "server",
-        Path.home() / "llama.cpp" / "build" / "server",
-        Path.home() / "llama.cpp" / "server",
-        "/usr/local/bin/llama-server",
-        "/usr/local/bin/server"
-    ]
-    
-    for location in possible_locations:
-        if location.exists() and os.access(location, os.X_OK):
-            return str(location)
-    
-    # Last resort - look in path
-    for binary_name in ["llama-server", "server"]:
+
+    # Try direct PATH lookup first (most reliable for package-managed installs)
+    for binary_name in ["llama-server", "llama-cpp-server", "server"]:
         try:
             result = subprocess.run(["which", binary_name], capture_output=True, text=True)
             if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip()
-        except:
-            pass
-    
-    # Really last resort - search for it
+                server_path = result.stdout.strip()
+                if os.path.isfile(server_path) and os.access(server_path, os.X_OK):
+                    print(f"Found server binary in PATH: {server_path}")
+                    return server_path
+        except Exception as e:
+            print(f"Error checking PATH for {binary_name}: {str(e)}")
+
+    # For Chaotic AUR-specific paths
+    chaotic_paths = [
+        "/usr/bin/llama-server",
+        "/usr/bin/llama-cpp-server",
+        "/usr/local/bin/llama-server"
+    ]
+
+    for path in chaotic_paths:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            print(f"Found server binary at known location: {path}")
+            return path
+
+    # Check the saved path from installation
+    server_path_file = Path.home() / "aibuddy" / "server_path"
+    if server_path_file.exists():
+        try:
+            with open(server_path_file, "r") as f:
+                line = f.readline().strip()
+                if line.startswith("LLAMA_SERVER="):
+                    server_path = line[13:].strip('"\'')
+                    if os.path.isfile(server_path) and os.access(server_path, os.X_OK):
+                        print(f"Found server binary from saved path: {server_path}")
+                        return server_path
+        except Exception as e:
+            print(f"Error reading server path file: {str(e)}")
+
+    # Check common build locations for local build
+    build_paths = [
+        Path.home() / "llama.cpp" / "build" / "bin" / "server",
+        Path.home() / "llama.cpp" / "build" / "bin" / "llama-server",
+        Path.home() / "llama.cpp" / "build" / "server",
+        Path.home() / "llama.cpp" / "server"
+    ]
+
+    for path in build_paths:
+        path_str = str(path)
+        if os.path.isfile(path_str) and os.access(path_str, os.X_OK):
+            print(f"Found server binary at build location: {path_str}")
+            return path_str
+
+    # Last resort - full system search for executable
     try:
-        for llama_dir in [Path.home() / "llama.cpp"]:
-            if llama_dir.exists():
-                for root, dirs, files in os.walk(llama_dir):
-                    for file in files:
-                        if file == "server" or file == "llama-server":
-                            full_path = os.path.join(root, file)
-                            if os.access(full_path, os.X_OK):
-                                return full_path
-    except:
-        pass
+        for binary_name in ["llama-server", "server"]:
+            # Try using the 'find' command to locate the binary
+            result = subprocess.run(
+                ["find", "/usr", "/opt", "/home", "-name", binary_name, "-type", "f", "-executable"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                paths = result.stdout.strip().split('\n')
+                if paths and paths[0]:
+                    print(f"Found server binary with system search: {paths[0]}")
+                    return paths[0]
+    except Exception as e:
+        print(f"Error during system search: {str(e)}")
     
     return None
 
@@ -549,7 +609,7 @@ def start_server(config):
     # Find server binary
     server_binary = find_server_binary()
     if not server_binary:
-        click.echo(f"{Fore.RED}Error: llama.cpp server binary not found. Please build llama.cpp first.{Style.RESET_ALL}")
+        click.echo(f"{Fore.RED}Error: llama-server binary not found. Please make sure llama.cpp is installed.{Style.RESET_ALL}")
         sys.exit(1)
     
     click.echo(f"Using server binary: {server_binary}")
@@ -1304,7 +1364,7 @@ aibuddy logs --show-logs
 ## Requirements
 
 - Python 3.8 or newer
-- llama.cpp (built with CMake)
+- llama.cpp (system-installed or built locally)
 - GGUF model file
 
 ## Troubleshooting
@@ -1313,7 +1373,7 @@ If you encounter issues:
 
 1. Check the server logs: `aibuddy logs --show-logs`
 2. Make sure the model file exists and is correctly configured
-3. Verify that llama.cpp is properly installed
+3. Verify that llama-server is properly installed
 4. Try restarting the server: `aibuddy server --restart`
 
 For more help, run any command with `--help`.
